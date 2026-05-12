@@ -23,6 +23,7 @@ import re
 import json
 import logging
 import argparse
+import textwrap
 from pathlib import Path
 from urllib.parse import urlparse
 from datetime import datetime
@@ -137,11 +138,164 @@ WECHAT_SELECTORS = [
 MIN_CONTENT_LENGTH = 200
 
 
+def detect_code_language(attr_text):
+    """Infer code language from HTML attributes."""
+    attrs = attr_text or ""
+
+    data_lang = re.search(r'data-lang\s*=\s*["\']?([^"\'\s>]+)', attrs, flags=re.IGNORECASE)
+    if data_lang:
+        return data_lang.group(1).strip().lower()
+
+    class_match = re.search(r'class\s*=\s*["\']([^"\']+)', attrs, flags=re.IGNORECASE)
+    if class_match:
+        class_tokens = class_match.group(1).split()
+        for token in class_tokens:
+            lowered = token.lower()
+            for prefix in ("language-", "lang-", "brush:"):
+                if lowered.startswith(prefix):
+                    candidate = lowered[len(prefix):].strip(" ;")
+                    if candidate:
+                        return candidate
+        for token in class_tokens:
+            lowered = token.lower()
+            if re.fullmatch(r"[a-z][a-z0-9_+-]{1,20}", lowered):
+                return lowered
+
+    return ""
+
+
+def html_code_to_text(code_html):
+    """Convert code HTML fragment to plain code text."""
+    text = re.sub(r"<br\s*/?>", "\n", code_html, flags=re.IGNORECASE)
+    text = re.sub(r"</p\s*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<p\b[^>]*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"</?[^>]+>", "", text)
+    text = unescape(text).replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\u00a0", " ")
+    return textwrap.dedent(text).strip("\n")
+
+
+def extract_pre_code_blocks(html_raw):
+    """
+    Replace <pre> blocks with temporary placeholders and collect code blocks.
+    Returns (processed_html, blocks).
+    """
+    blocks = []
+    pre_re = re.compile(r"<pre\b([^>]*)>(.*?)</pre>", re.IGNORECASE | re.DOTALL)
+
+    def _replace(match):
+        pre_attrs = match.group(1) or ""
+        pre_inner = match.group(2) or ""
+        code_match = re.search(
+            r"<code\b([^>]*)>(.*?)</code>",
+            pre_inner,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        lang = ""
+        code_html = pre_inner
+        if code_match:
+            code_attrs = code_match.group(1) or ""
+            code_html = code_match.group(2) or ""
+            lang = detect_code_language(code_attrs)
+        if not lang:
+            lang = detect_code_language(pre_attrs)
+
+        code_text = html_code_to_text(code_html)
+        token = f"CODEBLOCKPLACEHOLDER{len(blocks)}"
+        blocks.append({"token": token, "lang": lang, "code": code_text})
+        return f"\n{token}\n"
+
+    processed = pre_re.sub(_replace, html_raw)
+    return processed, blocks
+
+
+def render_fenced_code(lang, code):
+    """Render fenced code block with optional language hint."""
+    code_text = code or ""
+    max_ticks = 0
+    for match in re.finditer(r"`+", code_text):
+        max_ticks = max(max_ticks, len(match.group(0)))
+    fence = "`" * max(3, max_ticks + 1)
+    lang_text = lang.strip() if lang else ""
+    if lang_text and not re.fullmatch(r"[a-zA-Z0-9_+-]+", lang_text):
+        lang_text = ""
+
+    if lang_text:
+        return f"{fence}{lang_text}\n{code_text}\n{fence}"
+    return f"{fence}\n{code_text}\n{fence}"
+
+
+def inject_code_block_placeholders(md, code_blocks):
+    """Replace temporary placeholders with fenced code blocks."""
+    rendered = md
+    for block in code_blocks:
+        fenced = render_fenced_code(block["lang"], block["code"])
+        rendered = rendered.replace(block["token"], fenced)
+    return rendered
+
+
+def normalize_markdown_lists(md):
+    """
+    Fix html2text list artifacts:
+    - "1. 1\\. foo" -> "1. foo"
+    - "* • foo" -> "* foo"
+    """
+    lines = md.splitlines()
+    normalized = []
+    in_fence = False
+
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            normalized.append(line)
+            continue
+
+        if not in_fence:
+            line = re.sub(r"^(\s*\d+\.\s+)\d+\\?\.\s+", r"\1", line)
+            line = re.sub(r"^(\s*[*+-]\s+)[•·▪◦]\s+", r"\1", line)
+        normalized.append(line)
+
+    return "\n".join(normalized)
+
+
+def collapse_blank_lines_outside_fences(md):
+    """Collapse 3+ blank lines to 2 outside fenced code blocks."""
+    lines = md.splitlines()
+    out = []
+    in_fence = False
+    blank_run = 0
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            blank_run = 0
+            out.append(line)
+            continue
+
+        if in_fence:
+            out.append(line)
+            continue
+
+        if stripped == "":
+            blank_run += 1
+            if blank_run <= 2:
+                out.append("")
+        else:
+            blank_run = 0
+            out.append(line)
+
+    return "\n".join(out).strip()
+
+
 def html_to_markdown(html_raw, max_chars=30000):
     """Convert raw HTML to clean Markdown."""
     import html2text
 
     html_raw = normalize_img_src(html_raw)
+    html_raw, code_blocks = extract_pre_code_blocks(html_raw)
 
     h = html2text.HTML2Text()
     h.ignore_links = False
@@ -149,9 +303,12 @@ def html_to_markdown(html_raw, max_chars=30000):
     h.body_width = 0       # No line wrapping
     h.skip_internal_links = True
     h.ignore_emphasis = False
+    h.backquote_code_style = True
 
     md = h.handle(html_raw)
-    md = re.sub(r"\n{3,}", "\n\n", md).strip()
+    md = inject_code_block_placeholders(md, code_blocks)
+    md = normalize_markdown_lists(md)
+    md = collapse_blank_lines_outside_fences(md)
     return md[:max_chars]
 
 
