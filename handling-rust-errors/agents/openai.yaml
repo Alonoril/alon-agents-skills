@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rust Error Handling"
+  short_description: "Apply project-standard typed Rust business error codes"
+  default_prompt: "Use $handling-rust-errors to implement or review Rust business error handling in this repository."
