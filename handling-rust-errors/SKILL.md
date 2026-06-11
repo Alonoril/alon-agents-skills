@@ -16,7 +16,9 @@ description: Use when adding, changing, reviewing, or debugging Rust production 
 - Prefer macros ending in `_logged` when an equivalent exists:
   - source `Result` error: `.map_err(map_err_logged!(DomainErr::Variant))?`
   - missing `Option` value: `.ok_or_else(ok_or_logged!(DomainErr::Variant))?`
-- Use `err!` or `app_err!` when directly producing an application error.
+- Directly return known business failures with `err!(DomainErr::Variant, context)`.
+- Do not create thin helpers that only wrap `AppError::from_code`,
+  `AppError::from_code_msg`, `app_err!`, or `err!`.
 - Use `AxumResult<T>` and `status_err!` only at HTTP boundaries requiring an explicit
   status candidate.
 - Include useful, non-sensitive dynamic context. Do not expose credentials or payloads.
@@ -24,7 +26,7 @@ description: Use when adding, changing, reviewing, or debugging Rust production 
 ## Standard Pattern
 
 ```rust
-use infra_core::{define_app_error_codes, map_err_logged, result::AppResult};
+use infra_core::{define_app_error_codes, err, map_err_logged, result::AppResult};
 
 define_app_error_codes! {
 	IndexerErr("IDX") {
@@ -34,6 +36,10 @@ define_app_error_codes! {
 }
 
 fn store_block(block: &Block) -> AppResult<()> {
+	if !block.is_next() {
+		return err!(IndexerErr::InvalidBlock, "block height is out of sequence");
+	}
+
 	storage::write(block).map_err(map_err_logged!(
 		IndexerErr::StorageWriteFailed,
 		format!("height={}", block.height())
@@ -47,6 +53,8 @@ fn store_block(block: &Block) -> AppResult<()> {
 - `anyhow::Result`, `anyhow!`, `bail!`, or ad hoc `AppError::new` in public business APIs.
 - Propagating third-party errors directly through business APIs.
 - `unwrap`, `expect`, or `panic!` for recoverable production failures.
+- Helpers such as `unexpected_message(detail) -> AppError` that only bind a fixed error
+  code. Write `return err!(GrpcErr::UnexpectedMessage, detail);` at the call site.
 
 Foreign error types are allowed only when an external trait or protocol requires them;
 convert them before entering business code.
